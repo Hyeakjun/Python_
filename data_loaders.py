@@ -1,6 +1,5 @@
 import os
 import random
-import re
 import numpy as np
 import librosa
 import torch
@@ -10,7 +9,7 @@ from torch.utils.data import Dataset
 
 def traverse_dir(
         root_dir,
-        extensions,
+        extension,
         amount=None,
         str_include=None,
         str_exclude=None,
@@ -22,7 +21,7 @@ def traverse_dir(
     cnt = 0
     for root, _, files in os.walk(root_dir):
         for file in files:
-            if any([file.endswith(f".{ext}") for ext in extensions]):
+            if file.endswith(extension):
                 # path
                 mix_path = os.path.join(root, file)
                 pure_path = mix_path[len(root_dir)+1:] if is_pure else mix_path
@@ -57,7 +56,6 @@ def get_data_loaders(args, whole_audio=False):
         sample_rate=args.data.sampling_rate,
         load_all_data=args.train.cache_all_data,
         whole_audio=whole_audio,
-        extensions=args.data.extensions,
         n_spk=args.model.n_spk,
         device=args.train.cache_device,
         fp16=args.train.cache_fp16,
@@ -77,7 +75,6 @@ def get_data_loaders(args, whole_audio=False):
         sample_rate=args.data.sampling_rate,
         load_all_data=args.train.cache_all_data,
         whole_audio=True,
-        extensions=args.data.extensions,
         n_spk=args.model.n_spk)
     loader_valid = torch.utils.data.DataLoader(
         data_valid,
@@ -98,7 +95,6 @@ class AudioDataset(Dataset):
         sample_rate,
         load_all_data=True,
         whole_audio=False,
-        extensions=['wav'],
         n_spk=1,
         device = 'cpu',
         fp16 = False,
@@ -112,10 +108,10 @@ class AudioDataset(Dataset):
         self.path_root = path_root
         self.paths = traverse_dir(
             os.path.join(path_root, 'audio'),
-            extensions=extensions,
+            extension='wav',
             is_pure=True,
             is_sort=True,
-            is_ext=True
+            is_ext=False
         )
         self.whole_audio = whole_audio
         self.use_aug = use_aug
@@ -124,21 +120,20 @@ class AudioDataset(Dataset):
             print('Load all the data from :', path_root)
         else:
             print('Load the f0, volume data from :', path_root)
-        for name_ext in tqdm(self.paths, total=len(self.paths)):
-            path_audio = os.path.join(self.path_root, 'audio', name_ext)
+        for name in tqdm(self.paths, total=len(self.paths)):
+            path_audio = os.path.join(self.path_root, 'audio', name) + '.wav'
             duration = librosa.get_duration(filename = path_audio, sr = self.sample_rate)
             
-            path_f0 = os.path.join(self.path_root, 'f0', name_ext) + '.npy'
+            path_f0 = os.path.join(self.path_root, 'f0', name) + '.npy'
             f0 = np.load(path_f0)
             f0 = torch.from_numpy(f0).float().unsqueeze(-1).to(device)
                 
-            path_volume = os.path.join(self.path_root, 'volume', name_ext) + '.npy'
+            path_volume = os.path.join(self.path_root, 'volume', name) + '.npy'
             volume = np.load(path_volume)
             volume = torch.from_numpy(volume).float().unsqueeze(-1).to(device)
             
             if n_spk is not None and n_spk > 1:
-                dirname_split = re.split(r"_|\-", os.path.dirname(name_ext), 2)[0]
-                spk_id = int(dirname_split) if str.isdigit(dirname_split) else 0
+                spk_id = int(os.path.dirname(name)) if str.isdigit(os.path.dirname(name)) else 0
                 if spk_id < 1 or spk_id > n_spk:
                     raise ValueError(' [x] Muiti-speaker traing error : spk_id must be a positive integer from 1 to n_spk ')
             else:
@@ -151,7 +146,7 @@ class AudioDataset(Dataset):
                     audio = librosa.to_mono(audio)
                 audio = torch.from_numpy(audio).to(device)
                 
-                path_units = os.path.join(self.path_root, 'units', name_ext) + '.npy'
+                path_units = os.path.join(self.path_root, 'units', name) + '.npy'
                 units = np.load(path_units)
                 units = torch.from_numpy(units).to(device)
                 
@@ -159,7 +154,7 @@ class AudioDataset(Dataset):
                     audio = audio.half()
                     units = units.half()
                     
-                self.data_buffer[name_ext] = {
+                self.data_buffer[name] = {
                         'duration': duration,
                         'audio': audio,
                         'units': units,
@@ -168,7 +163,7 @@ class AudioDataset(Dataset):
                         'spk_id': spk_id
                         }
             else:
-                self.data_buffer[name_ext] = {
+                self.data_buffer[name] = {
                         'duration': duration,
                         'f0': f0,
                         'volume': volume,
@@ -177,17 +172,16 @@ class AudioDataset(Dataset):
            
 
     def __getitem__(self, file_idx):
-        name_ext = self.paths[file_idx]
-        data_buffer = self.data_buffer[name_ext]
+        name = self.paths[file_idx]
+        data_buffer = self.data_buffer[name]
         # check duration. if too short, then skip
         if data_buffer['duration'] < (self.waveform_sec + 0.1):
             return self.__getitem__( (file_idx + 1) % len(self.paths))
             
         # get item
-        return self.get_data(name_ext, data_buffer)
+        return self.get_data(name, data_buffer)
 
-    def get_data(self, name_ext, data_buffer):
-        name = os.path.splitext(name_ext)[0]
+    def get_data(self, name, data_buffer):
         frame_resolution = self.hop_size / self.sample_rate
         duration = data_buffer['duration']
         waveform_sec = duration if self.whole_audio else self.waveform_sec
@@ -198,7 +192,7 @@ class AudioDataset(Dataset):
         units_frame_len = int(waveform_sec / frame_resolution)
         audio = data_buffer.get('audio')
         if audio is None:
-            path_audio = os.path.join(self.path_root, 'audio', name_ext)
+            path_audio = os.path.join(self.path_root, 'audio', name) + '.wav'
             audio, sr = librosa.load(
                     path_audio, 
                     sr = self.sample_rate, 
@@ -215,7 +209,7 @@ class AudioDataset(Dataset):
         # load units
         units = data_buffer.get('units')
         if units is None:
-            units  = os.path.join(self.path_root, 'units', name_ext) + '.npy'
+            units  = os.path.join(self.path_root, 'units', name) + '.npy'
             units = np.load(units)
             units = units[start_frame : start_frame + units_frame_len]
             units = torch.from_numpy(units).float() 
